@@ -1,0 +1,22 @@
+# NRP Nautilus overrides for the skyportal-k8s-deploy chart.
+#   helm install skyportal ../skyportal-k8s-deploy/chart -f values-nrp.yaml -n skyportal
+
+image:
+  repository: ghcr.io/skyportal/skyportal
+  tag: ""                         # set to the built nrp-deploy image SHA
+
+# NRP west region (us-central storage is full).
+postgres:
+  storage:
+    storageClassName: rook-ceph-block
+persistentData:
+  storageClassName: rook-cephfs
+  size: 100Gi
+
+ingress:
+  className: haproxy              # NRP default ingress controller
+  host: skyportal.nrp-nautilus.io
+  tls:
+    enabled: true
+    clusterIssuer: ""             # VERIFY: NRP may front *.nrp-nautilus.io with a wildcard
+                                  # cert (leave issuer empty); otherwise set a cert-manager issuer.

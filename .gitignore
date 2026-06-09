@@ -1,0 +1,3 @@
+# real secrets never get committed; copy secrets.example.yaml -> secrets.yaml
+secrets.yaml
+.env
