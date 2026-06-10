@@ -3,7 +3,11 @@
 
 image:
   repository: ghcr.io/skyportal/skyportal
-  tag: ""                         # set to the built nrp-deploy image SHA
+  # :amd64 base + COPY babamul plugin into /skyportal/services/babamul (baked, so the
+  # workers run it without cloning from github, which NRP pods can't reach). Rebuild via the
+  # overlay Dockerfile (FROM …:amd64; COPY babamul /skyportal/services/babamul) when the
+  # base or the plugin changes. Do NOT `--set image.tag=amd64` on upgrade (drops babamul).
+  tag: "amd64-babamul"
 
 # NRP west region (us-central storage is full).
 postgres:
@@ -20,3 +24,32 @@ ingress:
     enabled: true
     clusterIssuer: ""             # VERIFY: NRP may front *.nrp-nautilus.io with a wildcard
                                   # cert (leave issuer empty); otherwise set a cert-manager issuer.
+
+# Chart's default workers.enabled list + `babamul` (the baked external ingestion service;
+# its creds live in services.external.babamul.params in the secret config). Helm replaces
+# lists, so the full list is repeated here.
+roles:
+  workers:
+    enabled:
+      - cron
+      - dask
+      - external_logging
+      - recurring_apis
+      - facility_queue
+      - gcn_service
+      - health_monitor
+      - hermes_skyportal_sync
+      - ngsf_analysis_service
+      - notification_queue
+      - observation_plan_queue
+      - openai_analysis_service
+      - pdl_service
+      - reminders
+      - sharing_service_submission_queue
+      - slack
+      - sn_analysis_service
+      - spectral_cube_analysis_service
+      - thumbnail_queue
+      - tns_retrieval_queue
+      - watch_list
+      - babamul

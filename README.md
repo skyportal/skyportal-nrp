@@ -54,3 +54,39 @@ $K exec skyportal-postgres-0 -- psql -U skyportal -d skyportal -c \
   and the `notice_types` (15 voevent + 3 json — copy from `fritz-deploy/deploy.py`) to the secret
   config.yaml, then restart the workers. `gcn_service` then ingests live events.
 - Secrets live only in the k8s Secret + gitignored `.env` — never in the repo.
+
+## Alert ingestion (babamul)
+
+Live ZTF/LSST alerts come from the babamul broker via the
+[babamul-skyportal-plugin](https://github.com/skyportal/babamul-skyportal-plugin) (a SkyPortal
+external service). **NRP pods can't resolve `github.com`, so the plugin is baked into the image**
+instead of cloned at startup — otherwise `setup_services` fails to clone, hits `KeyError: 'babamul'`,
+and CrashLoops the whole workers pod.
+
+```bash
+# 1. Bake an overlay image (base + plugin at services.paths[-1] = /skyportal/services; strip repo/rev
+#    from the plugin's config.yaml.defaults so it's treated as present-not-cloned -> no clone, no KeyError).
+git clone https://github.com/skyportal/babamul-skyportal-plugin.git babamul
+( cd babamul && rm -rf .git && sed -i '' '/^[[:space:]]*repo:/d; /^[[:space:]]*rev:/d' config.yaml.defaults )
+printf 'FROM ghcr.io/skyportal/skyportal:amd64\nCOPY --chown=skyportal:skyportal babamul /skyportal/services/babamul\n' > Dockerfile
+docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-babamul --push .
+#    values-nrp.yaml already pins image.tag: amd64-babamul and lists `babamul` in roles.workers.enabled.
+#    Never `--set image.tag=amd64` on upgrade (it drops babamul).
+
+# 2. Streams + filter + access (run once in the app pod, via the models): create `ZTF Public` and
+#    `LSST` streams, a `babamul` Filter on the ZTF stream in the Sitewide group (id 1), attach both
+#    streams to group 1, and give each scanning user group-1 membership + stream access. Without a
+#    filter, alerts ingest as Objs+photometry only and never reach the scanning page.
+
+# 3. Secret config `services.external.babamul.params` (creds + ingest targets — note: NO repo/rev,
+#    the plugin is baked), then restart the workers:
+#      kafka:  {host: kaboom.caltech.edu, port: 9093, username, password, sasl_mechanism: SCRAM-SHA-512,
+#               topics: [babamul.ztf.no-lsst-match.hosted, babamul.ztf.lsst-match.hosted]}
+#      ingest: {filter_ids: [<babamul filter>], group_ids: [1], ztf_stream_ids: [<ZTF Public>], lsst_stream_ids: [<LSST>]}
+$K rollout restart deployment/skyportal-workers    # re-reads from earliest (offsets are never committed)
+```
+
+Per alert the plugin creates an Obj + photometry (ZTF, plus the LSST `survey_matches` object linked
+via a SuperObj) and a Candidate under each `filter_ids`. Notes: workers use `strategy: Recreate`
+(single instance — no duplicate queues/gcn); the plugin dedupes photometry by SkyPortal's
+`(origin, mjd, fluxerr, flux)` upsert key (babamul repeats the current detection in prv_candidates).
