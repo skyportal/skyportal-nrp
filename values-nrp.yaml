@@ -7,7 +7,7 @@ image:
   # workers run it without cloning from github, which NRP pods can't reach). Rebuild via the
   # overlay Dockerfile (FROM …:amd64; COPY babamul /skyportal/services/babamul) when the
   # base or the plugin changes. Do NOT `--set image.tag=amd64` on upgrade (drops babamul).
-  tag: "amd64-babamul"
+  tag: "amd64-babamul2"
 
 # NRP west region (us-central storage is full).
 postgres:

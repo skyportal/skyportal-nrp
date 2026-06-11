@@ -69,8 +69,8 @@ and CrashLoops the whole workers pod.
 git clone https://github.com/skyportal/babamul-skyportal-plugin.git babamul
 ( cd babamul && rm -rf .git && sed -i '' '/^[[:space:]]*repo:/d; /^[[:space:]]*rev:/d' config.yaml.defaults )
 printf 'FROM ghcr.io/skyportal/skyportal:amd64\nCOPY --chown=skyportal:skyportal babamul /skyportal/services/babamul\n' > Dockerfile
-docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-babamul --push .
-#    values-nrp.yaml already pins image.tag: amd64-babamul and lists `babamul` in roles.workers.enabled.
+docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-babamul2 --push .  # bump the tag each rebuild to force a re-pull
+#    values-nrp.yaml pins image.tag (currently amd64-babamul2) and lists `babamul` in roles.workers.enabled.
 #    Never `--set image.tag=amd64` on upgrade (it drops babamul).
 
 # 2. Streams + filter + access (run once in the app pod, via the models): create `ZTF Public` and
@@ -83,10 +83,26 @@ docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-
 #      kafka:  {host: kaboom.caltech.edu, port: 9093, username, password, sasl_mechanism: SCRAM-SHA-512,
 #               topics: [babamul.ztf.no-lsst-match.hosted, babamul.ztf.lsst-match.hosted]}
 #      ingest: {filter_ids: [<babamul filter>], group_ids: [1], ztf_stream_ids: [<ZTF Public>], lsst_stream_ids: [<LSST>]}
+#      api:    {base_url: https://babamul.caltech.edu/api/babamul, token: <BABAMUL_API_TOKEN>}  # cutout thumbnails
 $K rollout restart deployment/skyportal-workers    # re-reads from earliest (offsets are never committed)
 ```
 
-Per alert the plugin creates an Obj + photometry (ZTF, plus the LSST `survey_matches` object linked
-via a SuperObj) and a Candidate under each `filter_ids`. Notes: workers use `strategy: Recreate`
-(single instance — no duplicate queues/gcn); the plugin dedupes photometry by SkyPortal's
-`(origin, mjd, fluxerr, flux)` upsert key (babamul repeats the current detection in prv_candidates).
+Per alert the plugin creates an Obj, fetches its **new/ref/sub cutout thumbnails** from the babamul
+API (the `api` block above), ingests photometry (ZTF, plus the LSST `survey_matches` object linked
+via a SuperObj), and registers a Candidate under each `filter_ids`. Notes: workers use
+`strategy: Recreate` (single instance — no duplicate queues/gcn); the plugin dedupes photometry by
+SkyPortal's `(origin, mjd, fluxerr, flux)` upsert key (babamul repeats the current detection in
+prv_candidates). Cutouts are fetched only on **first sight** of an Obj — to backfill existing
+objects, loop the plugin's `add_cutout_thumbnails` with a **fresh `DBSession()` per object** (sharing
+one session cascades `Can't operate on closed transaction`).
+
+## Thumbnails — two gotchas
+
+- **PanSTARRS:** `Obj.panstarrs_url` scrapes `ps1images.stsci.edu` server-side, but treats an
+  empty/None `app.ps1_cutout_url` as "skip" → returns the `currently_unavailable` placeholder
+  (SDSS/Legacy-Survey are direct URLs, so they're unaffected). Set
+  `app.ps1_cutout_url: http://ps1images.stsci.edu/cgi-bin/ps1cutouts` in the secret config.
+- **File permissions:** cutout PNGs are written to `static/thumbnails`, a shared `rook-cephfs`
+  subPath. The kubelet creates it `root:root` and `fsGroup: 1000` does **not** chown subPaths, so
+  uid-1000 pods get `[Errno 13] Permission denied`. Fix once with a root pod:
+  `chown -R 1000:1000 /mnt/thumbnails` (PVC `skyportal-data` mounted at `/mnt`).
