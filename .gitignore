@@ -1,3 +1,6 @@
 # real secrets never get committed; copy secrets.example.yaml -> secrets.yaml
 secrets.yaml
 .env
+
+# OSG plugin secret (real, filled-in copy)
+osg/secret.yaml

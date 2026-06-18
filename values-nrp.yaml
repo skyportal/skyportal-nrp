@@ -7,12 +7,13 @@ image:
   # workers run it without cloning from github, which NRP pods can't reach). Rebuild via the
   # overlay Dockerfile (FROM …:amd64; COPY babamul /skyportal/services/babamul) when the
   # base or the plugin changes. Do NOT `--set image.tag=amd64` on upgrade (drops babamul).
-  tag: "amd64-babamul2"
+  tag: "amd64-babamul3"
 
 # NRP west region (us-central storage is full).
 postgres:
   storage:
     storageClassName: rook-ceph-block
+    size: 100Gi   # expanded from the 20Gi default (babamul photometry growth)
 persistentData:
   storageClassName: rook-cephfs
   size: 100Gi

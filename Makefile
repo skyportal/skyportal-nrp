@@ -6,7 +6,7 @@ VALUES  ?= values-nrp.yaml
 SECRETS ?= secrets.yaml
 ROLE    ?= app
 
-.PHONY: help secrets lint template install upgrade uninstall status logs
+.PHONY: help secrets lint template install upgrade uninstall status logs osg-secret osg osg-logs
 
 help:
 	@echo "skyportal-nrp (NS=$(NS), CHART=$(CHART)):"
@@ -36,3 +36,13 @@ status:
 
 logs:
 	kubectl logs -n $(NS) -l skyportal.role=$(ROLE) --tail=200 -f
+
+# --- OSG plugin service (standalone Deployment, see osg/README.md) ---
+osg-secret:
+	kubectl apply -n $(NS) -f osg/secret.yaml
+
+osg:
+	kubectl apply -n $(NS) -f osg/deployment.yaml
+
+osg-logs:
+	kubectl logs -n $(NS) -l skyportal.role=osg --tail=200 -f

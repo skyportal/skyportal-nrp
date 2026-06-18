@@ -69,8 +69,8 @@ and CrashLoops the whole workers pod.
 git clone https://github.com/skyportal/babamul-skyportal-plugin.git babamul
 ( cd babamul && rm -rf .git && sed -i '' '/^[[:space:]]*repo:/d; /^[[:space:]]*rev:/d' config.yaml.defaults )
 printf 'FROM ghcr.io/skyportal/skyportal:amd64\nCOPY --chown=skyportal:skyportal babamul /skyportal/services/babamul\n' > Dockerfile
-docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-babamul2 --push .  # bump the tag each rebuild to force a re-pull
-#    values-nrp.yaml pins image.tag (currently amd64-babamul2) and lists `babamul` in roles.workers.enabled.
+docker buildx build --platform linux/amd64 -t ghcr.io/skyportal/skyportal:amd64-babamul3 --push .  # bump the tag each rebuild to force a re-pull
+#    values-nrp.yaml pins image.tag (currently amd64-babamul3) and lists `babamul` in roles.workers.enabled.
 #    Never `--set image.tag=amd64` on upgrade (it drops babamul).
 
 # 2. Streams + filter + access (run once in the app pod, via the models): create `ZTF Public` and

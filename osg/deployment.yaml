@@ -1,0 +1,136 @@
+# Standalone OSG-plugin service on NRP (namespace: skyportal).
+#   make osg-secret      # apply osg/secret.yaml (your filled copy, gitignored)
+#   make osg             # apply this
+# or directly:
+#   kubectl -n skyportal apply -f osg/secret.yaml
+#   kubectl -n skyportal apply -f osg/deployment.yaml
+#
+# Its own Deployment + ClusterIP Service (not baked into the skyportal app/workers
+# pods): it carries OSG-specific deps (htcondor2), a SciToken, and egress to ap41
+# that shouldn't touch the main pods, and a restart shouldn't bounce SkyPortal.
+# SkyPortal reaches it in-cluster at http://skyportal-osg:7100 — no public ingress.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skyportal-osg
+  labels:
+    app: skyportal
+    skyportal.role: osg
+spec:
+  replicas: 1
+  # Single instance: keepalive parks one held placeholder job + one poller loop;
+  # a second replica would duplicate both. Recreate avoids two pods overlapping.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      skyportal.role: osg
+  template:
+    metadata:
+      labels:
+        app: skyportal
+        skyportal.role: osg
+    spec:
+      # prp-gpu-2.t2.ucsd.edu accepts the pod but its kubelet never starts the
+      # container (stuck Pending, no sandbox) — steer away from it. Add more
+      # hostnames here if other nodes wedge the same way.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - prp-gpu-2.t2.ucsd.edu
+      containers:
+        - name: osg
+          image: ghcr.io/skyportal/skyportal:amd64-osg1
+          imagePullPolicy: IfNotPresent
+          # Wrapper does two NRP-specific setup steps, then execs the plugin:
+          #  1. Stage the AP IDTOKEN into ~/.condor/tokens.d at 0600 — HTCondor
+          #     IDTOKENS auth REFUSES the world-readable (0644) secret mount, so
+          #     submit/spool to ap41 fails until the token is in a private dir.
+          #  2. Run via the uv venv python (system python3 lacks the deps), and
+          #     --config so baselayer's load_env loads our osg config (it only
+          #     auto-loads the skyportal/baselayer *.defaults → else KeyError 'osg').
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p "$HOME/.condor/tokens.d"
+              install -m 600 /secrets/scitokens/osg.use "$HOME/.condor/tokens.d/osg.use"
+              exec /skyportal/.venv/bin/python main.py --config /osg-skyportal-plugin/config.yaml
+          ports:
+            - name: osg-port
+              containerPort: 7100
+          env:
+            - name: PYTHONPATH
+              value: /skyportal
+          volumeMounts:
+            # services.external.osg.params (listener/htcondor/osdf/auth/caps).
+            - name: config
+              mountPath: /osg-skyportal-plugin/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            # SciToken(s) for ap41 submission + OSDF; paths must match the
+            # *_token_path values in config.yaml.
+            - name: scitokens
+              mountPath: /secrets/scitokens
+              readOnly: true
+            # Writable scratch for per-job staging (inputs.json etc.).
+            - name: staging
+              mountPath: /tmp/staging
+          # The listener is the readiness signal; give the schedd rehydrate +
+          # keepalive bootstrap room before liveness can kill it.
+          startupProbe:
+            tcpSocket: { port: osg-port }
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket: { port: osg-port }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket: { port: osg-port }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: config
+          secret:
+            secretName: skyportal-osg-secret
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: scitokens
+          secret:
+            secretName: skyportal-osg-secret
+            # Only the token keys, mapped to the filenames config.yaml expects.
+            items:
+              - key: osg.use
+                path: osg.use
+              - key: osdf-read.use
+                path: osdf-read.use
+              - key: osdf-write.use
+                path: osdf-write.use
+        - name: staging
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: skyportal-osg
+  labels:
+    app: skyportal
+    skyportal.role: osg
+spec:
+  type: ClusterIP
+  selector:
+    skyportal.role: osg
+  ports:
+    - name: osg-port
+      port: 7100
+      targetPort: osg-port
