@@ -17,11 +17,18 @@ metadata:
     app: skyportal
     skyportal.role: osg
 spec:
-  replicas: 1
-  # Single instance: keepalive parks one held placeholder job + one poller loop;
-  # a second replica would duplicate both. Recreate avoids two pods overlapping.
+  replicas: 3
+  # The submit path is a synchronous handler that blocks ~1-2s per condor
+  # submit, so a single replica serializes requests and times out under bursts.
+  # Scale out instead: each replica handles its own jobs end-to-end
+  # (submit -> poll -> callback) with no shared state, and parks its own
+  # keepalive placeholder (a few extra held jobs, harmless). Rolling updates
+  # keep some replicas serving during a redeploy.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       skyportal.role: osg
@@ -43,9 +50,18 @@ spec:
                     operator: NotIn
                     values:
                       - prp-gpu-2.t2.ucsd.edu
+        # Co-locate on the SkyPortal app's node: NRP cross-node pod networking is
+        # flaky (the app couldn't reach the plugin's ClusterIP when it landed on
+        # other nodes), but same-node pod-to-pod always works.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  skyportal.role: app
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: osg
-          image: ghcr.io/skyportal/skyportal:amd64-osg1
+          image: ghcr.io/skyportal/skyportal:amd64-osg5
           imagePullPolicy: IfNotPresent
           # Wrapper does two NRP-specific setup steps, then execs the plugin:
           #  1. Stage the AP IDTOKEN into ~/.condor/tokens.d at 0600 — HTCondor
@@ -127,7 +143,11 @@ metadata:
     app: skyportal
     skyportal.role: osg
 spec:
-  type: ClusterIP
+  # Headless (clusterIP: None): NRP's ClusterIP/kube-proxy routing is unreliable
+  # here (the app could reach the pod IP directly but not the ClusterIP VIP), so
+  # resolve `skyportal-osg` straight to the pod IP — same pattern as the postgres
+  # StatefulSet service, which works.
+  clusterIP: None
   selector:
     skyportal.role: osg
   ports:
