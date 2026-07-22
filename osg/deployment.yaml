@@ -38,6 +38,9 @@ spec:
         app: skyportal
         skyportal.role: osg
     spec:
+      # Give the plugin time to drain its batch queue on SIGTERM (graceful
+      # shutdown flushes buffered fire-and-forget requests before exit).
+      terminationGracePeriodSeconds: 40
       # prp-gpu-2.t2.ucsd.edu accepts the pod but its kubelet never starts the
       # container (stuck Pending, no sandbox) — steer away from it. Add more
       # hostnames here if other nodes wedge the same way.
