@@ -6,7 +6,14 @@ VALUES  ?= values-nrp.yaml
 SECRETS ?= secrets.yaml
 ROLE    ?= app
 
-.PHONY: help secrets lint template install upgrade uninstall status logs osg-secret osg osg-logs
+REGISTRY      ?= ghcr.io/skyportal/skyportal-nrp
+SKYPORTAL_SHA := $(shell git -C skyportal rev-parse --short HEAD 2>/dev/null)
+# Same scheme the CI workflow uses, so a local build and a CI build of the same
+# submodule commit produce the same tag.
+BASE_TAG      ?= sp-$(SKYPORTAL_SHA)
+PLATFORM      ?= linux/amd64
+
+.PHONY: help secrets lint template install upgrade uninstall status logs osg-secret osg osg-logs image print-tags
 
 help:
 	@echo "skyportal-nrp (NS=$(NS), CHART=$(CHART)):"
@@ -46,3 +53,11 @@ osg:
 
 osg-logs:
 	kubectl logs -n $(NS) -l skyportal.role=osg --tail=200 -f
+
+# --- Image (from the pinned skyportal submodule; needs docker + ghcr login) ---
+# OSG is baked into the base image (services/osg); no separate overlay.
+image:  ## build+push the base skyportal image at the pinned commit
+	docker buildx build --platform $(PLATFORM) -t $(REGISTRY):$(BASE_TAG) --push skyportal
+
+print-tags:  ## show the image tag for the pinned commit
+	@echo "base: $(REGISTRY):$(BASE_TAG)"

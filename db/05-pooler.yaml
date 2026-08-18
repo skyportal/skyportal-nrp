@@ -1,0 +1,23 @@
+# PgBouncer (transaction mode) in front of the primary, mirroring Fritz's
+# production pooler. The app connects to `skyportal-db-pooler-rw:5432` instead of
+# hitting Postgres directly, so the many short-lived SkyPortal worker connections
+# don't exhaust max_connections. Optional but recommended at production scale.
+#
+# If you use this, set database.host: skyportal-db-pooler-rw in skyportal-secrets
+# (otherwise use skyportal-db-rw). SkyPortal's own config-driven pooler stays
+# disabled — pooling happens here instead.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: skyportal-db-pooler-rw
+  namespace: skyportal
+spec:
+  cluster:
+    name: skyportal-db
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "100"

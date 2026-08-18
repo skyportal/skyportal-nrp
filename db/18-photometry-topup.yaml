@@ -1,0 +1,65 @@
+# Demo recent-photometry top-up. Extracts the last 30 days of photometry FROM THE
+# EXISTING DUMP on demo-restore-scratch (NOT production: photometry.id correlation
+# ~0 and there's no mjd/created_at index, so any 30-day pull scans the whole 455GB
+# table — we filter the dump instead, zero production load). group_photometry is
+# derived locally from `sources` (obj->group) so points are visible on lightcurves.
+#
+# Boundary id 1058955970 = created_at ~2026-06-22 (30d before the dump), found by
+# binary-searching the pkey (recorded here so the job is reproducible).
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: demo-phot-topup, namespace: skyportal }
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: demo-phot-topup } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: demo-restore-scratch }
+      containers:
+        - name: topup
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              B=1058955970
+              until pg_isready -h skyportal-demo-db -U postgres >/dev/null 2>&1; do sleep 5; done
+              # Only the photometry TABLE DATA entry (not group_/stream_photometry).
+              pg_restore -l /scratch/dump | grep -E ' TABLE DATA public photometry ' > /scratch/toc.phot
+              echo "toc.phot: $(cat /scratch/toc.phot)"
+              echo "=== stream photometry data from dump, keep id>=$B, COPY into demo ==="
+              set -o pipefail
+              time pg_restore -L /scratch/toc.phot --data-only -f - /scratch/dump \
+                | awk -F'\t' -v B=$B '
+                    /^COPY .* FROM stdin;$/ {print; d=1; next}
+                    d && $0=="\\." {print; d=0; next}
+                    d {if ($1+0 >= B) print; next}
+                    {print}' \
+                | psql -h skyportal-demo-db -U postgres -d skyportal -v ON_ERROR_STOP=1 -q
+              rc=$?; echo "load rc=$rc"; [ $rc -ne 0 ] && exit $rc
+              echo "photometry rows: $(psql -h skyportal-demo-db -U postgres -d skyportal -tAc 'SELECT count(*) FROM photometry;')"
+              echo "=== derive group_photometry from sources (obj->group visibility) ==="
+              # Pre-dedup sources to one row per (obj,group) so the join is sort-free
+              # (a global DISTINCT over the 30M-row join spills for ~30min instead).
+              time psql -h skyportal-demo-db -U postgres -d skyportal -v ON_ERROR_STOP=1 -c "
+                SET maintenance_work_mem='2GB';
+                CREATE TEMP TABLE og AS SELECT DISTINCT obj_id, group_id FROM sources WHERE active;
+                CREATE INDEX ON og(obj_id);
+                ANALYZE og;
+                INSERT INTO group_photometry (group_id, photometr_id, created_at, modified)
+                SELECT og.group_id, p.id, now(), now()
+                FROM photometry p JOIN og ON og.obj_id = p.obj_id;"
+              echo "group_photometry rows: $(psql -h skyportal-demo-db -U postgres -d skyportal -tAc 'SELECT count(*) FROM group_photometry;')"
+              echo "== PHOTOMETRY TOP-UP DONE =="
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: skyportal-demo-db, key: POSTGRES_PASSWORD } } }
+          resources:
+            requests: { cpu: "3", memory: 3Gi }
+            limits: { cpu: "3", memory: 3Gi }
+          volumeMounts: [ { name: scratch, mountPath: /scratch } ]

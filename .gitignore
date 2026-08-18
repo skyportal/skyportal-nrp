@@ -4,3 +4,13 @@ secrets.yaml
 
 # OSG plugin secret (real, filled-in copy)
 osg/secret.yaml
+
+# CNPG DB secrets (real, filled-in copies; only the .example files are committed)
+db/01-s3-credentials.yaml
+db/02-app-credentials.yaml
+db/07-gcs-credentials.yaml
+db/17-demo-db-credentials.yaml
+nrp-s3
+
+# One-off operational dumps (see db/README.md); not part of the deployment.
+filters-deleted-*.txt

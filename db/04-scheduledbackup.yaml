@@ -1,0 +1,14 @@
+# Daily base backup to S3. Combined with continuous WAL archiving (backup block
+# in 03-cluster.yaml) this gives point-in-time recovery within retentionPolicy.
+# Take a fresh base backup right after the initial data load / cutover too.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: skyportal-db-daily
+  namespace: skyportal
+spec:
+  # 6-field cron (seconds first): 02:00 every day.
+  schedule: "0 0 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: skyportal-db

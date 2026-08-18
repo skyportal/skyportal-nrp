@@ -1,0 +1,101 @@
+# DUMP job — runs in the PRODUCTION fritz GKE cluster
+# (gke_skyportal-206621_us-west2-a_fritz), NOT on NRP. It's in-VPC, so it reaches
+# Cloud SQL's private IP and uploads to GCS for free. Read-only against the DB.
+#
+# Created SUSPENDED so it doesn't add read load to prod until you pick an off-peak
+# window. Structure: initContainer pg_dump (PG18, directory format, parallel) →
+# scratch PVC; main container uploads that dir to GCS. The NRP restore Job
+# (07-restore-job.yaml) then pulls from ${DEST}.
+#
+# Prereq — create the connection secret imperatively (keeps the password out of
+# this file and out of your terminal); the values come from the prod `config`
+# Secret:
+#   CTX=gke_skyportal-206621_us-west2-a_fritz
+#   PW=$(kubectl --context $CTX -n default get secret config \
+#        -o jsonpath='{.data.config\.yaml}' | base64 -d \
+#        | python3 -c "import sys,yaml;print(yaml.safe_load(sys.stdin)['database']['password'])")
+#   kubectl --context $CTX -n default create secret generic fritz-db-dump-conn \
+#     --from-literal=PGHOST=10.49.1.19 --from-literal=PGPORT=5432 \
+#     --from-literal=PGDATABASE=fritz-1 --from-literal=PGUSER=postgres \
+#     --from-literal=PGPASSWORD="$PW"
+#
+# Launch (off-peak):
+#   kubectl --context $CTX -n default patch job fritz-db-dump \
+#     --type merge -p '{"spec":{"suspend":false}}'
+# Watch:
+#   kubectl --context $CTX -n default logs -f job/fritz-db-dump -c pg-dump
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fritz-db-dump-scratch
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 600Gi   # holds a -Z1 directory dump (~200-300 GB) with margin
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fritz-db-dump
+  namespace: default
+spec:
+  suspend: true                  # unsuspend off-peak (see header)
+  backoffLimit: 0                # a multi-hour dump should not blindly retry
+  activeDeadlineSeconds: 86400   # 24h cap
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: fritz-db-dump
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: fritz-db-dump-scratch
+      # 1) pg_dump directly from Cloud SQL to the scratch PVC.
+      initContainers:
+        - name: pg-dump
+          image: postgres:18
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              mkdir -p /scratch/dump
+              echo "== pg_dump ${PGDATABASE} @ ${PGHOST} -Fd -j ${JOBS} -Z1 =="
+              time pg_dump -Fd -j "${JOBS}" -Z1 --no-owner --no-privileges \
+                -f /scratch/dump
+              echo "== dump size =="; du -sh /scratch/dump
+          envFrom:
+            - secretRef:
+                name: fritz-db-dump-conn     # PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD
+          env:
+            - name: JOBS
+              value: "6"     # parallel table dumps; the single huge photometry table is still serial
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits:   { cpu: "4", memory: 4Gi }
+      # 2) Upload the dump directory to GCS (same-continent → no egress charge).
+      containers:
+        - name: upload
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "== gsutil rsync -> ${DEST} =="
+              time gsutil -m rsync -r /scratch/dump "${DEST}"
+              echo "== uploaded to ${DEST} =="
+          env:
+            - name: DEST
+              value: gs://fritz-db-exports/trial/   # NRP restore Job pulls from here
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "2", memory: 2Gi }

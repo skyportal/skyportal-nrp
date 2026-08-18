@@ -1,0 +1,102 @@
+# Grafana for the #6284 dashboard, reading the Prometheus sidecar in the app pod.
+#   kubectl -n skyportal create secret generic skyportal-grafana-secret --from-literal=admin-password=<pw>
+#   kubectl -n skyportal create configmap skyportal-grafana-dashboard \
+#     --from-file=skyportal-overview.json=../skyportal/observability/grafana/dashboards/skyportal-overview.json
+#   kubectl -n skyportal apply -f observability/grafana.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: skyportal-grafana-provisioning, namespace: skyportal }
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://skyportal-prometheus:9090
+        isDefault: true
+        editable: false
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: SkyPortal
+        orgId: 1
+        folder: SkyPortal
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: skyportal-grafana, namespace: skyportal, labels: { app: skyportal, skyportal.role: grafana } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { skyportal.role: grafana } }
+  template:
+    metadata: { labels: { app: skyportal, skyportal.role: grafana } }
+    spec:
+      # Co-locate on the app node: the Prometheus sidecar is reached via the
+      # headless skyportal-prometheus (pod IP), and NRP cross-node pod networking
+      # is flaky — same-node pod-to-pod is reliable (same pattern as osg/).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { skyportal.role: app } }
+              topologyKey: kubernetes.io/hostname
+      securityContext: { fsGroup: 472, runAsUser: 472 }
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.5.0
+          ports: [ { containerPort: 3000, name: http } ]
+          env:
+            - { name: GF_SERVER_ROOT_URL, value: "https://skyportal-grafana.nrp-nautilus.io" }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: skyportal-grafana-secret, key: admin-password } } }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Viewer" }
+            - { name: GF_USERS_DEFAULT_THEME, value: "light" }
+          volumeMounts:
+            - { name: provisioning-ds, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: provisioning-db, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards, mountPath: /var/lib/grafana/dashboards }
+            - { name: data, mountPath: /var/lib/grafana }
+          readinessProbe: { httpGet: { path: /api/health, port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "200m", memory: "512Mi" }
+      volumes:
+        - name: provisioning-ds
+          configMap: { name: skyportal-grafana-provisioning, items: [ { key: datasource.yaml, path: datasource.yaml } ] }
+        - name: provisioning-db
+          configMap: { name: skyportal-grafana-provisioning, items: [ { key: dashboards.yaml, path: dashboards.yaml } ] }
+        - name: dashboards
+          configMap: { name: skyportal-grafana-dashboard }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: skyportal-grafana, namespace: skyportal, labels: { app: skyportal, skyportal.role: grafana } }
+spec:
+  selector: { skyportal.role: grafana }
+  ports: [ { name: http, port: 80, targetPort: http } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: skyportal-grafana
+  namespace: skyportal
+  labels: { app: skyportal }
+spec:
+  ingressClassName: haproxy
+  tls:
+    - hosts: [ skyportal-grafana.nrp-nautilus.io ]
+      secretName: skyportal-grafana-tls
+  rules:
+    - host: skyportal-grafana.nrp-nautilus.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: skyportal-grafana, port: { number: 80 } } }

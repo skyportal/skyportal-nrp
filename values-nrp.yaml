@@ -2,12 +2,13 @@
 #   helm install skyportal ../skyportal-k8s-deploy/chart -f values-nrp.yaml -n skyportal
 
 image:
-  repository: ghcr.io/skyportal/skyportal
-  # :amd64 base + COPY babamul plugin into /skyportal/services/babamul (baked, so the
-  # workers run it without cloning from github, which NRP pods can't reach). Rebuild via the
-  # overlay Dockerfile (FROM …:amd64; COPY babamul /skyportal/services/babamul) when the
-  # base or the plugin changes. Do NOT `--set image.tag=amd64` on upgrade (drops babamul).
-  tag: "amd64-babamul3"
+  # Own package, not shared with Fritz: this image tracks the skyportal commit
+  # pinned by our submodule, which is diverging from Fritz's.
+  repository: ghcr.io/skyportal/skyportal-nrp
+  # Built by .github/workflows/build-image.yml on push (and by `make image`
+  # locally). The tag is sp-<skyportal submodule short sha>; skyportal-data
+  # (sncosmo) is baked in by the Dockerfile, so no extra -rN suffix is needed.
+  tag: "sp-ae69874f"
 
 # NRP west region (us-central storage is full).
 postgres:
@@ -26,10 +27,13 @@ ingress:
     clusterIssuer: ""             # VERIFY: NRP may front *.nrp-nautilus.io with a wildcard
                                   # cert (leave issuer empty); otherwise set a cert-manager issuer.
 
-# Chart's default workers.enabled list + `babamul` (the baked external ingestion service;
-# its creds live in services.external.babamul.params in the secret config). Helm replaces
-# lists, so the full list is repeated here.
+# Full workers list (Helm replaces lists). No babamul; OSG is separate (osg/).
 roles:
+  app:
+    # 8 tornado processes (server.processes=8 in the config) need cores to match.
+    resources:
+      requests: { cpu: "2", memory: "2Gi" }
+      limits:   { cpu: "8", memory: "6Gi" }
   workers:
     enabled:
       - cron
@@ -53,4 +57,10 @@ roles:
       - thumbnail_queue
       - tns_retrieval_queue
       - watch_list
-      - babamul
+
+# Prometheus sidecar scraping the app workers (skyportal PR #6284). Needs the app
+# config observability.enabled (set in skyportal-secrets) + skyportal-obs-secret.
+observability:
+  enabled: true
+  prometheus:
+    workers: 8      # match server.processes so all app workers are scraped

@@ -1,0 +1,36 @@
+# Backup-enablement patch for the `skyportal-db` cluster. Apply AFTER an S3 token
+# + bucket exist (NRP is NOT OBC-based — use the User Portal -> S3 Tokens page,
+# Central pool, per NRP support; then create the bucket). This is a MERGE PATCH,
+# not a standalone manifest — `kubectl apply` would strip the cluster's other fields.
+#
+# 1) NRP User Portal (/s3token/) -> S3 Tokens -> generate a token for the CENTRAL
+#    pool. Put the pair in the skyportal-db-s3 Secret (01-s3-credentials.yaml).
+# 2) Create the bucket once (from any pod/host with the token + awscli):
+#      aws s3api create-bucket --bucket skyportal-db-backups \
+#        --endpoint-url https://s3-central.nrp-nautilus.io
+# 3) Apply this patch:
+#      kubectl --context nautilus -n skyportal patch cluster skyportal-db \
+#        --type merge --patch-file db/09-backup.yaml
+# 4) Enable the schedule + first base backup:
+#      kubectl --context nautilus -n skyportal apply -f db/04-scheduledbackup.yaml
+#      kubectl --context nautilus -n skyportal cnpg backup skyportal-db
+spec:
+  backup:
+    retentionPolicy: "30d"
+    barmanObjectStore:
+      destinationPath: s3://skyportal-db-backups/
+      # In-cluster Central RGW endpoint (CNPG backup runs from in-cluster pods).
+      endpointURL: http://rook-ceph-rgw-centrals3.rook-central
+      s3Credentials:
+        accessKeyId:
+          name: skyportal-db-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: skyportal-db-s3
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+        maxParallel: 8
+      data:
+        compression: gzip
+        jobs: 4

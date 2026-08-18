@@ -1,0 +1,103 @@
+# Ceph (rook-ceph-block) restore-to-completion benchmark — the deployable number.
+# postgres:18 target + restore-only Job reusing the 148G dump on bench-restore-scratch.
+#
+# Lock-convoy mitigation: restore in SECTIONS instead of one parallel pass —
+# pre-data SERIAL (creates the localizationtiles partitions/tables without workers
+# racing on partition-parent locks), then data + post-data in parallel. Each
+# section is timed so we see where the hours actually go (bulk load vs index build).
+# Publishes gs://fritz-db-exports/trial/_BENCHMARK_CEPH.txt.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bench-pg-data, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 800Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-pg, namespace: skyportal, labels: { app: bench-pg } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: bench-pg } }
+  template:
+    metadata: { labels: { app: bench-pg } }
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: bench-pg-data }
+      containers:
+        - name: postgres
+          image: postgres:18
+          args: [postgres, "-c","maintenance_work_mem=2GB","-c","max_parallel_maintenance_workers=4","-c","synchronous_commit=off","-c","max_wal_size=8GB","-c","shared_buffers=4GB","-c","checkpoint_timeout=30min"]
+          env:
+            - { name: POSTGRES_DB, value: skyportal_trial }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [ { containerPort: 5432 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data } ]
+          readinessProbe: { exec: { command: ["pg_isready","-U","postgres"] }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: "8", memory: 16Gi }, limits: { cpu: "8", memory: 16Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-pg, namespace: skyportal }
+spec:
+  selector: { app: bench-pg }
+  ports: [ { port: 5432, targetPort: 5432 } ]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: bench-restore, namespace: skyportal }
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200   # 12h to completion
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: bench-restore } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: bench-restore-scratch }
+        - name: gcs-key
+          secret: { secretName: fritz-gcs-key }
+      initContainers:
+        - name: restore
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "waiting for bench-pg (Ceph) ..."
+              until pg_isready -h bench-pg -U postgres >/dev/null 2>&1; do sleep 5; done
+              R=/scratch/benchmark_ceph.txt
+              C="-h bench-pg -U postgres -d skyportal_trial --no-owner --no-privileges"
+              { echo "=== NRP Ceph (rook-ceph-block) SECTIONED restore benchmark ==="; echo "start: $(date -u)"; echo "dump: $(du -sh /scratch/dump | cut -f1)"; } | tee "$R"
+              { echo "--- pre-data (serial) ---"; time pg_restore $C --section=pre-data /scratch/dump; } >>"$R" 2>&1 || echo "pre-data rc=$?" >>"$R"
+              { echo "--- data (-j6) ---";       time pg_restore $C --section=data -j 6 /scratch/dump; } >>"$R" 2>&1 || echo "data rc=$?" >>"$R"
+              { echo "--- post-data (-j6) ---";  time pg_restore $C --section=post-data -j 6 /scratch/dump; } >>"$R" 2>&1 || echo "post-data rc=$?" >>"$R"
+              { echo "--- analyze ---"; time vacuumdb -h bench-pg -U postgres -d skyportal_trial --analyze-in-stages -j 6; } >>"$R" 2>&1 || true
+              echo "rows(photometry): $(psql -h bench-pg -U postgres -d skyportal_trial -tAc 'SELECT count(*) FROM photometry;' 2>/dev/null)" >>"$R"
+              echo "db size: $(psql -h bench-pg -U postgres -d skyportal_trial -tAc "SELECT pg_size_pretty(pg_database_size('skyportal_trial'));" 2>/dev/null)" >>"$R"
+              echo "end: $(date -u)" >>"$R"; cat "$R"
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+          resources: { requests: { cpu: "4", memory: 8Gi }, limits: { cpu: "4", memory: 8Gi } }
+          volumeMounts: [ { name: scratch, mountPath: /scratch } ]
+      containers:
+        - name: publish
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud storage cp /scratch/benchmark_ceph.txt gs://fritz-db-exports/trial/_BENCHMARK_CEPH.txt
+              echo "== CEPH BENCHMARK PUBLISHED =="; cat /scratch/benchmark_ceph.txt
+          resources: { requests: { cpu: "1", memory: 2Gi }, limits: { cpu: "1", memory: 2Gi } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }

@@ -11,9 +11,8 @@ ClusterIP naming, the `michael.coughlin` / `UMN_Coughlin` OSG account, the
 SciToken) lives **here** in skyportal-nrp.
 
 Artifacts:
-- `Dockerfile` — service image (`FROM …skyportal:amd64` + htcondor + the plugin).
-  The plugin checkout is the **build context** (the COPYs read from it).
 - `deployment.yaml` — `skyportal-osg` Deployment + ClusterIP Service on `7100`.
+  Runs the osg service baked into the base image at `/skyportal/services/osg`.
 - `secret.example.yaml` — config.yaml (osg params) + SciToken(s); copy to
   `secret.yaml` (gitignored) and fill in.
 
@@ -35,14 +34,14 @@ Artifacts:
    ```
 3. A SkyPortal admin API token (for the register step).
 
-## Build + push the image
+## Build the image
+
+OSG is baked into the base skyportal image (`services/osg` + htcondor); there is
+no separate OSG image. Build/push it from the repo root:
 
 ```sh
-# context = the plugin checkout (last arg). Bump the tag on every change.
-docker buildx build --platform linux/amd64 \
-  -f osg/Dockerfile \
-  -t ghcr.io/skyportal/skyportal:amd64-osg1 --push \
-  /Users/mcoughlin/Code/ZTF/osg-skyportal-plugin
+make image        # ghcr.io/skyportal/skyportal:fritz-<sha>
+make print-tags   # show the tag
 ```
 
 ## Deploy
@@ -71,7 +70,8 @@ fresh AP is fine), and — with keepalive on — a parked placeholder job.
 and `<name>` must equal `--name`:
 
 ```sh
-# run from the plugin checkout (it has register_analysis_service.py):
+# register_analysis_service.py lives in the plugin repo; clone it and run:
+#   git clone https://github.com/skyportal/osg-skyportal-plugin && cd osg-skyportal-plugin
 python3 register_analysis_service.py \
   --name nmma_osg \
   --display "NMMA (OSG/OSPool)" \
@@ -90,7 +90,7 @@ Then trigger an analysis on a source to smoke-test end to end.
 # in-cluster reachability (from any pod in the namespace):
 kubectl -n skyportal exec deploy/skyportal-app -- curl -sf http://skyportal-osg:7100/jobs
 # the plugin's token view (use the venv python — system python3 lacks the deps):
-kubectl -n skyportal exec deploy/skyportal-osg -- /skyportal/.venv/bin/python bin/check_token.py /secrets/scitokens/osg.use
+kubectl -n skyportal exec deploy/skyportal-osg -- /skyportal/.venv/bin/python services/osg/bin/check_token.py /secrets/scitokens/osg.use
 ```
 
 ## Open items

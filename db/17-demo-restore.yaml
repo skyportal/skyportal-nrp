@@ -1,0 +1,129 @@
+# Demo instance DB: persistent postgres:18 on Ceph holding Fritz's data, plus a
+# browsable-first restore Job. NOT a benchmark — this DB backs the demo skyportal.
+#
+# Browsable-first: restore everything EXCEPT the localizationtiles data+indexes
+# (GCN skymap tiles — huge, index-heavy, non-essential for browsing sources /
+# candidates / photometry). The table structure stays (app won't crash); its data
+# + indexes get loaded later in the background. This dodges the 12h index wall.
+#
+# Prerequisite: the `skyportal-demo-db` Secret must exist before applying this.
+# It is NOT defined here — copy 17-demo-db-credentials.example.yaml to
+# 17-demo-db-credentials.yaml (gitignored), fill in the password, and apply it:
+#
+#   kubectl apply -n skyportal -f db/17-demo-db-credentials.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: skyportal-demo-db-data, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 800Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: skyportal-demo-db, namespace: skyportal, labels: { app: skyportal-demo-db } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: skyportal-demo-db } }
+  template:
+    metadata: { labels: { app: skyportal-demo-db } }
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: skyportal-demo-db-data }
+      containers:
+        - name: postgres
+          image: postgres:18
+          args: [postgres, "-c","maintenance_work_mem=4GB","-c","max_parallel_maintenance_workers=4","-c","synchronous_commit=off","-c","max_wal_size=16GB","-c","shared_buffers=4GB","-c","checkpoint_timeout=30min"]
+          env:
+            - { name: POSTGRES_DB, value: skyportal }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: skyportal-demo-db, key: POSTGRES_PASSWORD } } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [ { containerPort: 5432 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data } ]
+          readinessProbe: { exec: { command: ["pg_isready","-U","postgres"] }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: "8", memory: 16Gi }, limits: { cpu: "8", memory: 16Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: skyportal-demo-db, namespace: skyportal }
+spec:
+  selector: { app: skyportal-demo-db }
+  ports: [ { port: 5432, targetPort: 5432 } ]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: demo-restore-scratch, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 250Gi } }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: demo-restore, namespace: skyportal }
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: demo-restore } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: demo-restore-scratch }
+        - name: gcs-key
+          secret: { secretName: fritz-gcs-key }
+      initContainers:
+        - name: fetch
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud config set storage/sliced_object_download_max_components 1 2>/dev/null || true
+              gcloud config set storage/process_count 2 2>/dev/null || true
+              mkdir -p /scratch/dump
+              n=0
+              until gcloud storage rsync --recursive gs://fritz-db-exports/demo/ /scratch/dump; do
+                n=$((n+1)); echo "fetch retry $n"; [ $n -ge 200 ] && exit 1; sleep 30
+              done
+              rm -f /scratch/dump/_UPLOADED
+              echo "fetched: $(du -sh /scratch/dump)"
+          resources: { requests: { cpu: "2", memory: 8Gi }, limits: { cpu: "2", memory: 8Gi } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }
+        - name: restore
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "waiting for skyportal-demo-db ..."
+              until pg_isready -h skyportal-demo-db -U postgres >/dev/null 2>&1; do sleep 5; done
+              # SUBSET: exclude data+indexes for the ~1TB giants (photometry family,
+              # comments, localizationtiles) — keep their table structure. Recent
+              # photometry gets topped up separately via a filtered COPY from Cloud SQL.
+              pg_restore -l /scratch/dump > /scratch/toc.full
+              grep -viE '(TABLE DATA|INDEX)[^;]*(localizationtiles|photometr|comments)' /scratch/toc.full > /scratch/toc.demo
+              echo "=== subset restore (photometry/joins/comments/localizationtiles data deferred) ==="
+              time pg_restore -L /scratch/toc.demo -j 8 --no-owner --no-privileges \
+                -h skyportal-demo-db -U postgres -d skyportal /scratch/dump 2>&1 | tail -20 || echo "pg_restore rc=$?"
+              time vacuumdb -h skyportal-demo-db -U postgres -d skyportal --analyze-in-stages -j 8 || true
+              echo "rows(photometry): $(psql -h skyportal-demo-db -U postgres -d skyportal -tAc 'SELECT count(*) FROM photometry;' 2>/dev/null)"
+              echo "db size: $(psql -h skyportal-demo-db -U postgres -d skyportal -tAc "SELECT pg_size_pretty(pg_database_size('skyportal'));" 2>/dev/null)"
+              echo "== BROWSABLE-FIRST RESTORE DONE =="
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: skyportal-demo-db, key: POSTGRES_PASSWORD } } }
+          resources: { requests: { cpu: "4", memory: 8Gi }, limits: { cpu: "4", memory: 8Gi } }
+          volumeMounts: [ { name: scratch, mountPath: /scratch } ]
+      containers:
+        - name: done
+          image: postgres:18
+          command: ["/bin/bash","-c","echo restore job finished"]
+          resources: { requests: { cpu: "100m", memory: 256Mi }, limits: { cpu: "100m", memory: 256Mi } }

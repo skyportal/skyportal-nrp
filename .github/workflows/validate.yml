@@ -1,0 +1,102 @@
+name: Validate manifests
+
+# The deploy-repo analogue of fritz's build-and-test job. This repo ships no
+# code of its own -- it is helm values plus raw k8s manifests -- so the failure
+# mode worth catching is "it doesn't render / isn't valid k8s", which otherwise
+# only shows up at `helm upgrade` or `kubectl apply` time against a live cluster.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  helm:
+    name: Helm lint and template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout skyportal-nrp
+        uses: actions/checkout@v6
+        # No submodules: the chart render only reads values-nrp.yaml, and
+        # checking out skyportal here would pull ~GBs for nothing.
+
+      - name: Checkout chart
+        uses: actions/checkout@v6
+        with:
+          # Makefile defaults CHART to a sibling clone; mirror that layout so
+          # `make lint` / `make template` work unchanged in CI.
+          repository: skyportal/skyportal-k8s-deploy
+          path: skyportal-k8s-deploy
+          # Only needed if the chart repo is private; harmless when it is not.
+          token: ${{ secrets.CHART_REPO_TOKEN || github.token }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint skyportal-k8s-deploy/chart -f values-nrp.yaml
+
+      - name: helm template
+        # Renders every manifest the release would apply. Catches bad values
+        # keys, malformed lists, and template errors.
+        run: |
+          helm template skyportal skyportal-k8s-deploy/chart \
+            -f values-nrp.yaml > /tmp/rendered.yaml
+          echo "rendered $(grep -c '^---' /tmp/rendered.yaml) documents"
+
+      - name: Validate rendered manifests against k8s schemas
+        run: |
+          curl -sSLO https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform-linux-amd64.tar.gz
+          # -ignore-missing-schemas: CRDs (CNPG Cluster, ScheduledBackup,
+          # ServiceMonitor) have no schema in the default store.
+          ./kubeconform -strict -ignore-missing-schemas -summary /tmp/rendered.yaml
+
+  manifests:
+    name: Validate standalone manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kubeconform
+        run: |
+          curl -sSLO https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate db/ osg/ observability/ loadtest/
+        run: |
+          # *.example.yaml are credential stubs with placeholder values, and
+          # nrp-s3 is gitignored. Everything else should be applyable k8s.
+          shopt -s nullglob
+          files=()
+          for f in db/*.yaml osg/*.yaml observability/*.yaml loadtest/*.yaml; do
+            case "$f" in *.example.yaml) continue;; esac
+            files+=("$f")
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no manifests found"; exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          kubeconform -strict -ignore-missing-schemas -summary "${files[@]}"
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lint
+        run: |
+          pipx install yamllint
+          # Relaxed: these are hand-written manifests with long image refs and
+          # inline flow maps; only real syntax errors should fail the build.
+          yamllint -d "{extends: relaxed, rules: {line-length: disable}}" \
+            values-nrp.yaml secrets.example.yaml .github/workflows/ \
+            db/ osg/ observability/ loadtest/

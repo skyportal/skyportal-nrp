@@ -1,0 +1,169 @@
+# Self-driving overnight benchmark on NRP (non-destructive; scratch only).
+# A PG18 target + a restore Job that: waits for the GCS upload marker, fetches
+# the dump, pg_restores into a scratch DB, and publishes timings to GCS. Runs
+# entirely cluster-side — no dependency on an interactive session.
+#
+# Results land at gs://fritz-db-exports/trial/_BENCHMARK.txt (and in the Job log).
+# Nothing here touches the live skyportal app, its Postgres, prod, or DNS.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bench-pg-data, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 1000Gi } }   # restored heap + rebuilt indexes
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-pg, namespace: skyportal, labels: { app: bench-pg } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: bench-pg } }
+  template:
+    metadata: { labels: { app: bench-pg } }
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: bench-pg-data }
+      containers:
+        - name: postgres
+          image: postgres:18
+          # load-tuned server config (index builds run here)
+          args:
+            - postgres
+            - "-c"
+            - "maintenance_work_mem=2GB"
+            - "-c"
+            - "max_parallel_maintenance_workers=4"
+            - "-c"
+            - "synchronous_commit=off"
+            - "-c"
+            - "max_wal_size=8GB"
+            - "-c"
+            - "shared_buffers=4GB"
+            - "-c"
+            - "checkpoint_timeout=30min"
+          env:
+            - name: POSTGRES_DB
+              value: skyportal_trial
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports: [ { containerPort: 5432 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data } ]
+          readinessProbe:
+            exec: { command: ["pg_isready","-U","postgres"] }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "8", memory: 16Gi }
+            limits:   { cpu: "8", memory: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-pg, namespace: skyportal }
+spec:
+  selector: { app: bench-pg }
+  ports: [ { port: 5432, targetPort: 5432 } ]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bench-restore-scratch, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources: { requests: { storage: 250Gi } }   # holds the fetched 148 GB dump
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: bench-restore, namespace: skyportal }
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 28800    # 8h: wait + fetch + restore
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: bench-restore } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: bench-restore-scratch }
+        - name: gcs-key
+          secret: { secretName: fritz-gcs-key }
+      initContainers:
+        # 1) Wait for the upload marker, then pull the dump from GCS.
+        - name: wait-and-fetch
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              # Cap memory: no per-file slicing + modest parallelism (4Gi OOM'd before).
+              gcloud config set storage/sliced_object_download_max_components 1 2>/dev/null || true
+              gcloud config set storage/process_count 2 2>/dev/null || true
+              gcloud config set storage/thread_count 8 2>/dev/null || true
+              echo "waiting for gs://fritz-db-exports/trial/_UPLOADED ..."
+              until gcloud storage objects describe gs://fritz-db-exports/trial/_UPLOADED >/dev/null 2>&1; do sleep 60; done
+              echo "marker present; fetching dump ..."
+              mkdir -p /scratch/dump
+              n=0
+              until gcloud storage rsync --recursive gs://fritz-db-exports/trial/ /scratch/dump; do
+                n=$((n+1)); echo "fetch attempt $n failed (transient DNS?); retry in 30s"
+                [ $n -ge 200 ] && { echo "giving up"; exit 1; }; sleep 30
+              done
+              rm -f /scratch/dump/_UPLOADED /scratch/dump/_BENCHMARK.txt
+              echo "fetched:"; du -sh /scratch/dump
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }
+        # 2) Restore into the scratch DB, capturing timings to /scratch/benchmark.txt.
+        - name: restore
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "waiting for bench-pg ..."
+              until pg_isready -h bench-pg -U postgres >/dev/null 2>&1; do sleep 5; done
+              R=/scratch/benchmark.txt
+              { echo "=== NRP Ceph-RBD restore benchmark ==="
+                echo "start: $(date -u)"; echo "dump size: $(du -sh /scratch/dump | cut -f1)"; } | tee "$R"
+              { echo "--- pg_restore ---"; time pg_restore -h bench-pg -U postgres -d skyportal_trial \
+                  -j 6 --no-owner --no-privileges /scratch/dump; } >>"$R" 2>&1 || echo "pg_restore returned $?" >>"$R"
+              { echo "--- vacuum/analyze ---"; time vacuumdb -h bench-pg -U postgres -d skyportal_trial \
+                  --analyze-in-stages -j 6; } >>"$R" 2>&1 || true
+              echo "rows: $(psql -h bench-pg -U postgres -d skyportal_trial -tAc 'SELECT count(*) FROM photometry;' 2>/dev/null)" >>"$R"
+              echo "end: $(date -u)" >>"$R"
+              cat "$R"
+          env:
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+      # 3) Publish the timing summary to GCS so results survive teardown.
+      containers:
+        - name: publish
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud storage cp /scratch/benchmark.txt gs://fritz-db-exports/trial/_BENCHMARK.txt
+              echo "== BENCHMARK PUBLISHED =="; cat /scratch/benchmark.txt
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }

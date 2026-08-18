@@ -1,0 +1,120 @@
+# In-cluster restore Job: pulls the pg_dump directory from GCS, then runs a
+# parallel pg_restore + analyze against the CNPG primary (skyportal-db-rw). Runs
+# inside NRP so the restore has the fast in-cluster link to Postgres.
+#
+# Used by 06-migration-runbook.md for BOTH the timed trial (TARGET_DB defaults to
+# the throwaway `skyportal_trial`) and the real cutover (set TARGET_DB=skyportal).
+#
+# Prereqs:
+#   - CNPG cluster `skyportal-db` up (03-cluster.yaml), app secret applied (02-…).
+#   - Target DB already EXISTS and is empty: for the trial create `skyportal_trial`
+#     (runbook Phase 1); for prod the CNPG bootstrap already created `skyportal`.
+#   - GCS creds secret applied (07-gcs-credentials.yaml) and the dump synced to
+#     ${GCS_DUMP_URI} by the dump host.
+#   - Edit the CHANGE_ME/SIZE_ME values below.
+---
+# Scratch volume to stage the dump dir pulled from GCS. Size >= dump size.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skyportal-db-restore-scratch
+  namespace: skyportal
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: rook-ceph-block
+  resources:
+    requests:
+      storage: 800Gi   # SIZE_ME: >= the compressed dump directory
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: skyportal-db-restore
+  namespace: skyportal
+spec:
+  backoffLimit: 0                 # a multi-hour restore should not blindly auto-retry
+  activeDeadlineSeconds: 172800   # 48h hard cap
+  ttlSecondsAfterFinished: 86400  # auto-clean the Job object after a day
+  template:
+    metadata:
+      labels:
+        skyportal.role: db-restore
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: skyportal-db-restore-scratch
+        - name: gcs-key
+          secret:
+            secretName: skyportal-db-gcs
+
+      # 1) Pull the dump directory from GCS onto the scratch PVC.
+      #    (If the dump is already on a PVC you can drop this initContainer and
+      #    point the restore at that volume instead.)
+      initContainers:
+        - name: fetch-dump
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              mkdir -p /scratch/dump
+              gsutil -m rsync -r "${GCS_DUMP_URI}" /scratch/dump
+              echo "fetched dump:"; du -sh /scratch/dump
+          env:
+            - name: GCS_DUMP_URI
+              value: "gs://CHANGE_ME_bucket/fritz_dump"
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }
+
+      # 2) Parallel restore + analyze against the primary.
+      containers:
+        - name: restore
+          image: postgres:18          # matches the CNPG server + Cloud SQL source major
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "== restore into '${TARGET_DB}' on ${PGHOST} with -j ${JOBS} =="
+              # Fail fast if the target DB is missing (create it per the runbook).
+              psql -v ON_ERROR_STOP=1 -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='${TARGET_DB}'" | grep -q 1 \
+                || { echo "target DB '${TARGET_DB}' does not exist — create it first"; exit 1; }
+              echo "== pg_restore =="
+              time pg_restore -d "${TARGET_DB}" -j "${JOBS}" \
+                --no-owner --no-privileges --exit-on-error /scratch/dump
+              echo "== analyze =="
+              time vacuumdb -d "${TARGET_DB}" --analyze-in-stages -j "${JOBS}"
+              echo "== row-count spot check =="
+              psql -d "${TARGET_DB}" -c "SELECT count(*) AS photometry_rows FROM photometry;"
+              echo "== done =="
+          env:
+            - name: PGHOST
+              value: skyportal-db-rw
+            - name: PGUSER
+              value: skyportal
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: skyportal-db-app
+                  key: password
+            # TRIAL default. Set to `skyportal` for the real cutover.
+            - name: TARGET_DB
+              value: skyportal_trial
+            - name: JOBS
+              value: "8"
+            # Load tuning applied to every restore connection (server-side index
+            # builds). NOTE: index builds run on the DB pod, so keep
+            # JOBS × maintenance_work_mem under the CNPG pod's memory
+            # (8 × 2GB = 16GB fits the 32Gi cluster in 03-cluster.yaml).
+            - name: PGOPTIONS
+              value: "-c maintenance_work_mem=2GB -c max_parallel_maintenance_workers=4 -c synchronous_commit=off"
+          resources:
+            # The heavy lifting is server-side; the client is mostly IO/network.
+            requests: { cpu: "4", memory: 4Gi }
+            limits:   { cpu: "4", memory: 4Gi }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }

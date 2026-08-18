@@ -1,0 +1,142 @@
+# LINSTOR benchmark, CO-LOCATED with the igrok volume's SDSC/UCSD replicas.
+# postgres:18 on bench-pg-data-linstor (already on node-2-5/node-1-6.sdsc.optiputer.net),
+# pinned to those nodes via kubernetes.io/hostname so disk IO is local (not the
+# cross-country diskless attach we hit before). Own dump copy + names, so it runs
+# in parallel with the Ceph run (14). Sectioned restore, same as Ceph, for a fair
+# comparison. Publishes gs://fritz-db-exports/trial/_BENCHMARK_LINSTOR.txt.
+---
+# Local (SDSC igrok) scratch for this run's dump copy.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bench-lin-scratch, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: linstor-igrok
+  resources: { requests: { storage: 250Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-pg-lin, namespace: skyportal, labels: { app: bench-pg-lin } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: bench-pg-lin } }
+  template:
+    metadata: { labels: { app: bench-pg-lin } }
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - { key: kubernetes.io/hostname, operator: In, values: [node-2-5.sdsc.optiputer.net, node-1-6.sdsc.optiputer.net] }
+      tolerations:
+        - { key: nautilus.io/issue, operator: Exists }
+        - { key: nautilus.io/reservation, operator: Exists }
+        - { key: nautilus.io/science-dmz, operator: Exists }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: bench-pg-data-linstor }
+      containers:
+        - name: postgres
+          image: postgres:18
+          args: [postgres, "-c","maintenance_work_mem=2GB","-c","max_parallel_maintenance_workers=4","-c","synchronous_commit=off","-c","max_wal_size=8GB","-c","shared_buffers=4GB","-c","checkpoint_timeout=30min"]
+          env:
+            - { name: POSTGRES_DB, value: skyportal_trial }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [ { containerPort: 5432 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data } ]
+          readinessProbe: { exec: { command: ["pg_isready","-U","postgres"] }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: "8", memory: 16Gi }, limits: { cpu: "8", memory: 16Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-pg-lin, namespace: skyportal }
+spec:
+  selector: { app: bench-pg-lin }
+  ports: [ { port: 5432, targetPort: 5432 } ]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: bench-restore-lin, namespace: skyportal }
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: bench-restore-lin } }
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - { key: kubernetes.io/hostname, operator: In, values: [node-2-5.sdsc.optiputer.net, node-1-6.sdsc.optiputer.net] }
+      tolerations:
+        - { key: nautilus.io/issue, operator: Exists }
+        - { key: nautilus.io/reservation, operator: Exists }
+        - { key: nautilus.io/science-dmz, operator: Exists }
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: bench-lin-scratch }
+        - name: gcs-key
+          secret: { secretName: fritz-gcs-key }
+      initContainers:
+        - name: fetch
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud config set storage/sliced_object_download_max_components 1 2>/dev/null || true
+              gcloud config set storage/process_count 2 2>/dev/null || true
+              mkdir -p /scratch/dump
+              n=0
+              until gcloud storage rsync --recursive gs://fritz-db-exports/trial/ /scratch/dump; do
+                n=$((n+1)); echo "fetch retry $n"; [ $n -ge 200 ] && exit 1; sleep 30
+              done
+              rm -f /scratch/dump/_UPLOADED /scratch/dump/_BENCHMARK*.txt
+              echo "fetched: $(du -sh /scratch/dump)"
+          resources: { requests: { cpu: "2", memory: 8Gi }, limits: { cpu: "2", memory: 8Gi } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }
+        - name: restore
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "waiting for bench-pg-lin (SDSC-local LINSTOR) ..."
+              until pg_isready -h bench-pg-lin -U postgres >/dev/null 2>&1; do sleep 5; done
+              R=/scratch/benchmark_linstor.txt
+              C="-h bench-pg-lin -U postgres -d skyportal_trial --no-owner --no-privileges"
+              { echo "=== NRP LINSTOR igrok CO-LOCATED (SDSC) sectioned restore ==="; echo "start: $(date -u)"; echo "dump: $(du -sh /scratch/dump | cut -f1)"; } | tee "$R"
+              { echo "--- pre-data (serial) ---"; time pg_restore $C --section=pre-data /scratch/dump; } >>"$R" 2>&1 || echo "pre rc=$?" >>"$R"
+              { echo "--- data (-j6) ---";       time pg_restore $C --section=data -j 6 /scratch/dump; } >>"$R" 2>&1 || echo "data rc=$?" >>"$R"
+              { echo "--- post-data (-j6) ---";  time pg_restore $C --section=post-data -j 6 /scratch/dump; } >>"$R" 2>&1 || echo "post rc=$?" >>"$R"
+              { echo "--- analyze ---"; time vacuumdb -h bench-pg-lin -U postgres -d skyportal_trial --analyze-in-stages -j 6; } >>"$R" 2>&1 || true
+              echo "rows(photometry): $(psql -h bench-pg-lin -U postgres -d skyportal_trial -tAc 'SELECT count(*) FROM photometry;' 2>/dev/null)" >>"$R"
+              echo "db size: $(psql -h bench-pg-lin -U postgres -d skyportal_trial -tAc "SELECT pg_size_pretty(pg_database_size('skyportal_trial'));" 2>/dev/null)" >>"$R"
+              echo "end: $(date -u)" >>"$R"; cat "$R"
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+          resources: { requests: { cpu: "4", memory: 8Gi }, limits: { cpu: "4", memory: 8Gi } }
+          volumeMounts: [ { name: scratch, mountPath: /scratch } ]
+      containers:
+        - name: publish
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud storage cp /scratch/benchmark_linstor.txt gs://fritz-db-exports/trial/_BENCHMARK_LINSTOR.txt
+              echo "== LINSTOR CO-LOCATED BENCHMARK PUBLISHED =="; cat /scratch/benchmark_linstor.txt
+          resources: { requests: { cpu: "1", memory: 2Gi }, limits: { cpu: "1", memory: 2Gi } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }

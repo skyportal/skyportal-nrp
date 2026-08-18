@@ -1,0 +1,112 @@
+name: Build image
+
+# Builds the skyportal image from the pinned `skyportal` submodule and pushes it
+# to GHCR. Replaces the local `make image`, which cross-builds linux/amd64 under
+# QEMU on arm64 laptops (slow, and it fails outright when the Docker VM disk
+# fills: truncated downloads surface as "invalid signature" GPG errors).
+#
+# Runners are natively amd64, so the build is both faster and reproducible.
+# This job only builds and publishes; rolling the cluster stays manual
+# (`helm upgrade` with the new tag) since NRP auth is CILogon/OIDC.
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something that lands in the image changes.
+    paths:
+      - "skyportal"
+      - ".github/workflows/build-image.yml"
+  pull_request:
+    paths:
+      - "skyportal"
+      - ".github/workflows/build-image.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # The skyportal image is large; the stock runner leaves ~14G free on /,
+      # which is not enough to build and export it ("No space left on device").
+      # Same action fritz uses for the same reason.
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Recursive: skyportal itself carries `baselayer` and `skyportal-data`
+          # (SFD dust maps + sncosmo models). The Dockerfile bakes the latter in
+          # via `ADD . /skyportal` and points SNCOSMO_DATA_DIR at it, so it must
+          # be present at build time rather than fetched at runtime.
+          submodules: recursive
+
+      - name: Resolve tags
+        id: tags
+        run: |
+          SP_SHA=$(git -C skyportal rev-parse --short HEAD)
+          echo "sp_sha=${SP_SHA}" >> "$GITHUB_OUTPUT"
+          # Lowercase: GHCR rejects uppercase repository names.
+          echo "image=$(echo "${REGISTRY}/${IMAGE}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "Building skyportal @ ${SP_SHA}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Skipped on PRs: GITHUB_TOKEN is read-only for forks, and PRs build
+        # without publishing anyway.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: skyportal
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.tags.outputs.image }}:sp-${{ steps.tags.outputs.sp_sha }}
+            ${{ steps.tags.outputs.image }}:${{ github.sha }}
+            ${{ steps.tags.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo '```'
+            echo "${{ steps.tags.outputs.image }}:sp-${{ steps.tags.outputs.sp_sha }}"
+            echo '```'
+            echo ""
+            echo "Deploy with:"
+            echo '```bash'
+            echo "# set image.repository/image.tag in values-nrp.yaml, then:"
+            echo "make upgrade"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

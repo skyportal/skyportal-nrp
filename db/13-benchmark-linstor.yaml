@@ -1,0 +1,96 @@
+# LINSTOR benchmark (NRP-preferred storage for Postgres). Plain postgres:18
+# target on linstor-igrok + a restore-ONLY Job reusing the 148G dump already on
+# bench-restore-scratch (no re-fetch). Publishes _BENCHMARK_LINSTOR.txt to GCS.
+# Non-destructive scratch; compares directly against the Ceph run.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bench-pg-data, namespace: skyportal }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: linstor-igrok
+  resources: { requests: { storage: 500Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-pg, namespace: skyportal, labels: { app: bench-pg } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: bench-pg } }
+  template:
+    metadata: { labels: { app: bench-pg } }
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: bench-pg-data }
+      containers:
+        - name: postgres
+          image: postgres:18
+          args: [postgres, "-c","maintenance_work_mem=2GB","-c","max_parallel_maintenance_workers=4","-c","synchronous_commit=off","-c","max_wal_size=8GB","-c","shared_buffers=4GB","-c","checkpoint_timeout=30min"]
+          env:
+            - { name: POSTGRES_DB, value: skyportal_trial }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [ { containerPort: 5432 } ]
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data } ]
+          readinessProbe: { exec: { command: ["pg_isready","-U","postgres"] }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: "8", memory: 16Gi }, limits: { cpu: "8", memory: 16Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-pg, namespace: skyportal }
+spec:
+  selector: { app: bench-pg }
+  ports: [ { port: 5432, targetPort: 5432 } ]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: bench-restore, namespace: skyportal }
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata: { labels: { app: bench-restore } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: scratch
+          persistentVolumeClaim: { claimName: bench-restore-scratch }
+        - name: gcs-key
+          secret: { secretName: fritz-gcs-key }
+      initContainers:
+        - name: restore
+          image: postgres:18
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "waiting for bench-pg (LINSTOR) ..."
+              until pg_isready -h bench-pg -U postgres >/dev/null 2>&1; do sleep 5; done
+              R=/scratch/benchmark_linstor.txt
+              { echo "=== NRP LINSTOR (linstor-igrok) restore benchmark ==="; echo "start: $(date -u)"; echo "dump: $(du -sh /scratch/dump | cut -f1)"; } | tee "$R"
+              { echo "--- pg_restore -j6 ---"; time pg_restore -h bench-pg -U postgres -d skyportal_trial -j 6 --no-owner --no-privileges /scratch/dump; } >>"$R" 2>&1 || echo "pg_restore rc=$?" >>"$R"
+              { echo "--- analyze ---"; time vacuumdb -h bench-pg -U postgres -d skyportal_trial --analyze-in-stages -j 6; } >>"$R" 2>&1 || true
+              echo "rows(photometry): $(psql -h bench-pg -U postgres -d skyportal_trial -tAc 'SELECT count(*) FROM photometry;' 2>/dev/null)" >>"$R"
+              echo "db size: $(psql -h bench-pg -U postgres -d skyportal_trial -tAc "SELECT pg_size_pretty(pg_database_size('skyportal_trial'));" 2>/dev/null)" >>"$R"
+              echo "end: $(date -u)" >>"$R"; cat "$R"
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: bench-pg-secret, key: POSTGRES_PASSWORD } } }
+          resources: { requests: { cpu: "4", memory: 8Gi }, limits: { cpu: "4", memory: 8Gi } }
+          volumeMounts: [ { name: scratch, mountPath: /scratch } ]
+      containers:
+        - name: publish
+          image: google/cloud-sdk:slim
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              gcloud auth activate-service-account --key-file=/var/gcs/key.json
+              gcloud storage cp /scratch/benchmark_linstor.txt gs://fritz-db-exports/trial/_BENCHMARK_LINSTOR.txt
+              echo "== LINSTOR BENCHMARK PUBLISHED =="; cat /scratch/benchmark_linstor.txt
+          resources: { requests: { cpu: "1", memory: 2Gi }, limits: { cpu: "1", memory: 2Gi } }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: gcs-key, mountPath: /var/gcs, readOnly: true }

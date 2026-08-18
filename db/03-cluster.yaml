@@ -1,0 +1,123 @@
+# Production Postgres for SkyPortal on NRP, managed by the CloudNativePG operator.
+#
+# Named `skyportal-db` (NOT `skyportal-postgres`) so it runs ALONGSIDE the chart's
+# built-in StatefulSet during migration. Cut the app over by pointing
+# database.host at `skyportal-db-rw` (or the pooler, see 05-pooler.yaml), then
+# retire the chart Postgres. See README.md.
+#
+# Services CNPG creates: skyportal-db-rw (primary), skyportal-db-ro (replicas),
+# skyportal-db-r (any). The app must use -rw.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: skyportal-db
+  namespace: skyportal
+spec:
+  # 1 primary + 1 hot standby with automated failover. Bump to 3 for
+  # synchronous-quorum durability (see postgresql.synchronous below).
+  instances: 2
+
+  # PG18 to match the source (Cloud SQL `fritz-psql14` runs POSTGRES_18); a
+  # dump/restore target must be >= the source major. SkyPortal needs only contrib
+  # extensions, which are in this image; a non-contrib ext (e.g. q3c) would need a
+  # custom image FROM this one.
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+
+  primaryUpdateStrategy: unsupervised
+
+  # --- Storage -------------------------------------------------------------
+  # Source Cloud SQL disk is 1800 GB PD-SSD (actual data ~1 TB: ~455 GB
+  # photometry heap + ~214 GB indexes + the rest). 2000Gi comfortably exceeds it
+  # with headroom for growth, bloat, and the pending bigint rewrite. rook-ceph-block
+  # allows expansion, so this can grow later. Ceph RBD is networked storage —
+  # benchmark it under representative load (the timed trial) before trusting prod.
+  storage:
+    storageClass: rook-ceph-block
+    size: 2000Gi
+  # Separate WAL volume so WAL spikes (backfills, the bigint migration) can't
+  # fill the data volume and wedge the primary.
+  walStorage:
+    storageClass: rook-ceph-block
+    size: 100Gi
+
+  # --- Resources -----------------------------------------------------------
+  # requests == limits => Guaranteed QoS, so the DB pods are last to be evicted
+  # on this shared/preemptible platform. Size to the node you were allocated;
+  # shared_buffers below is tuned to this memory figure (~25%).
+  resources:
+    requests:
+      cpu: "8"
+      memory: 32Gi
+    limits:
+      cpu: "8"
+      memory: 32Gi
+
+  postgresql:
+    parameters:
+      max_connections: "400"
+      shared_buffers: 8GB
+      effective_cache_size: 24GB
+      work_mem: 64MB
+      # Raised well above the 64MB default so index rebuilds during restore and
+      # the bigint ALTER are fast (this was a named pain point).
+      maintenance_work_mem: 2GB
+      max_wal_size: 8GB
+      min_wal_size: 2GB
+      checkpoint_completion_target: "0.9"
+      max_worker_processes: "16"
+      max_parallel_workers: "16"
+      max_parallel_maintenance_workers: "4"
+      # wal_level=logical (CNPG default) — required if you migrate in via logical
+      # replication and useful for future CDC.
+      wal_level: logical
+    # For 3+ instances, uncomment for zero-data-loss failover:
+    # synchronous:
+    #   method: any
+    #   number: 1
+
+  # --- Bootstrap -----------------------------------------------------------
+  # Fresh, empty DB owned by the `skyportal` role (password from the app secret,
+  # see 02-app-credentials.example.yaml). Then run SkyPortal's schema/migrations
+  # (make db_init && migration_manager `alembic upgrade head`).
+  bootstrap:
+    initdb:
+      database: skyportal
+      owner: skyportal
+      secret:
+        name: skyportal-db-app
+  # --- MIGRATION ALTERNATIVE (see README) ---------------------------------
+  # To pull data straight from the existing DB at bootstrap instead of starting
+  # empty, replace the initdb block above with an import (pg_dump/restore over
+  # the network). For LOW-DOWNTIME, prefer logical replication / GCP DMS into
+  # the empty cluster and a short cutover — see README "Migrating the data".
+  #   bootstrap:
+  #     initdb:
+  #       import:
+  #         type: microservice
+  #         databases: ["skyportal"]
+  #         source:
+  #           externalCluster: source-db
+  #   externalClusters:
+  #     - name: source-db
+  #       connectionParameters:
+  #         host: <source-host>        # Cloud SQL proxy / current skyportal-postgres
+  #         user: skyportal
+  #         dbname: skyportal
+  #       password:
+  #         name: skyportal-db-app
+  #         key: password
+
+  # --- Backups -------------------------------------------------------------
+  # Deliberately omitted here so the cluster is deployable for the pre-S3 timed
+  # trial. Enable AFTER an S3 token + bucket exist (NRP User Portal -> S3 Tokens,
+  # Central pool): put the keys in 01-s3-credentials.yaml, then patch this cluster
+  # with 09-backup.yaml (static keys + the in-cluster Central RGW endpoint).
+  # Pairs with 04-scheduledbackup.yaml.
+
+  monitoring:
+    enablePodMonitor: true
+
+  # Keep the two instances on different nodes.
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname

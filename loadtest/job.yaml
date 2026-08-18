@@ -1,0 +1,39 @@
+# In-cluster k6 load test. Defaults to the NRP public URL; override BASE_URL +
+# TOKEN (a Fritz token) to baseline against fritz.science from the same vantage.
+#   kubectl -n skyportal create configmap skyportal-loadtest-script \
+#     --from-file=script.js=loadtest/k6-script.js -o yaml --dry-run=client | kubectl apply -f -
+#   kubectl -n skyportal apply -f loadtest/job.yaml
+#   kubectl -n skyportal logs -f job/skyportal-loadtest
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: skyportal-loadtest, namespace: skyportal }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: { labels: { app: skyportal, skyportal.role: loadtest } }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: script
+          configMap: { name: skyportal-loadtest-script }
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          command: ["k6", "run", "--summary-trend-stats=avg,p(50),p(90),p(95),p(99),max", "/scripts/script.js"]
+          env:
+            # Internal service isolates app/DB/Ceph capacity (bypasses the ingress,
+            # whose per-source-IP rate limit throttles a single-pod load generator).
+            # Use https://skyportal.nrp-nautilus.io for full end-to-end/ingress tests.
+            - { name: BASE_URL, value: "http://skyportal-app" }
+            - { name: TOKEN, valueFrom: { secretKeyRef: { name: skyportal-loadtest-token, key: token } } }
+            - { name: VUS_LOW,  value: "10" }
+            - { name: VUS_HIGH, value: "50" }
+            - { name: RAMP, value: "30s" }
+            - { name: HOLD, value: "1m" }
+          volumeMounts:
+            - { name: script, mountPath: /scripts, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: "512Mi" }
+            limits:   { cpu: "1", memory: "512Mi" }

@@ -5,9 +5,9 @@
 #   kubectl -n skyportal apply -f osg/secret.yaml
 #   kubectl -n skyportal apply -f osg/deployment.yaml
 #
-# Its own Deployment + ClusterIP Service (not baked into the skyportal app/workers
-# pods): it carries OSG-specific deps (htcondor2), a SciToken, and egress to ap41
-# that shouldn't touch the main pods, and a restart shouldn't bounce SkyPortal.
+# Runs the osg service (baked at /skyportal/services/osg in the base image) as its
+# own Deployment; the app/worker supervisors keep osg disabled. Isolates its
+# SciToken + egress to ap41 from the main pods, and a restart won't bounce SkyPortal.
 # SkyPortal reaches it in-cluster at http://skyportal-osg:7100 — no public ingress.
 apiVersion: apps/v1
 kind: Deployment
@@ -64,7 +64,9 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: osg
-          image: ghcr.io/skyportal/skyportal:amd64-osg5
+          # Keep in step with image.tag in values-nrp.yaml: the OSG plugin runs
+          # out of the same image as the app (services/osg is baked in).
+          image: ghcr.io/skyportal/skyportal-nrp:sp-ae69874f
           imagePullPolicy: IfNotPresent
           # Wrapper does two NRP-specific setup steps, then execs the plugin:
           #  1. Stage the AP IDTOKEN into ~/.condor/tokens.d at 0600 — HTCondor
@@ -79,7 +81,8 @@ spec:
               set -e
               mkdir -p "$HOME/.condor/tokens.d"
               install -m 600 /secrets/scitokens/osg.use "$HOME/.condor/tokens.d/osg.use"
-              exec /skyportal/.venv/bin/python main.py --config /osg-skyportal-plugin/config.yaml
+              cd /skyportal/services/osg
+              exec /skyportal/.venv/bin/python main.py --config /skyportal/services/osg/config.yaml
           ports:
             - name: osg-port
               containerPort: 7100
@@ -89,7 +92,7 @@ spec:
           volumeMounts:
             # services.external.osg.params (listener/htcondor/osdf/auth/caps).
             - name: config
-              mountPath: /osg-skyportal-plugin/config.yaml
+              mountPath: /skyportal/services/osg/config.yaml
               subPath: config.yaml
               readOnly: true
             # SciToken(s) for ap41 submission + OSDF; paths must match the
