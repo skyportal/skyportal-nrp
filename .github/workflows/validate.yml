@@ -33,8 +33,9 @@ jobs:
           # `make lint` / `make template` work unchanged in CI.
           repository: skyportal/skyportal-k8s-deploy
           path: skyportal-k8s-deploy
-          # Only needed if the chart repo is private; harmless when it is not.
-          token: ${{ secrets.CHART_REPO_TOKEN || github.token }}
+          # The chart lives on this branch, NOT on the default branch (master),
+          # which still holds the older kustomize-style layout with no chart/.
+          ref: modernize-helm-chart
 
       - uses: azure/setup-helm@v4
 
@@ -72,12 +73,15 @@ jobs:
 
       - name: Validate db/ osg/ observability/ loadtest/
         run: |
-          # *.example.yaml are credential stubs with placeholder values, and
+          # Skipped:
+          #   *.example.yaml - credential stubs with placeholder values
+          #   *.patch.yaml   - `kubectl patch --patch-file` fragments, which are
+          #                    bare `spec:` merge patches with no apiVersion/kind
           # nrp-s3 is gitignored. Everything else should be applyable k8s.
           shopt -s nullglob
           files=()
           for f in db/*.yaml osg/*.yaml observability/*.yaml loadtest/*.yaml; do
-            case "$f" in *.example.yaml) continue;; esac
+            case "$f" in *.example.yaml|*.patch.yaml) continue;; esac
             files+=("$f")
           done
           if [ ${#files[@]} -eq 0 ]; then

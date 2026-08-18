@@ -10,7 +10,7 @@
 #        --endpoint-url https://s3-central.nrp-nautilus.io
 # 3) Apply this patch:
 #      kubectl --context nautilus -n skyportal patch cluster skyportal-db \
-#        --type merge --patch-file db/09-backup.yaml
+#        --type merge --patch-file db/09-backup.patch.yaml
 # 4) Enable the schedule + first base backup:
 #      kubectl --context nautilus -n skyportal apply -f db/04-scheduledbackup.yaml
 #      kubectl --context nautilus -n skyportal cnpg backup skyportal-db

@@ -45,7 +45,7 @@ Edit `03-cluster.yaml` for reality — these are the fields that matter:
   placeholder).
 - **`resources`** — requests==limits for Guaranteed QoS; size to your allocated
   node. `shared_buffers` is set to ~25% of the 32Gi memory placeholder.
-- **Backups (09-backup.yaml)** — NRP uses portal S3 tokens, not OBC. Generate a
+- **Backups (09-backup.patch.yaml)** — NRP uses portal S3 tokens, not OBC. Generate a
   token at the User Portal `/s3token/` (Central pool; admins confirmed ~1 TB is
   fine), create the `skyportal-db-backups` bucket, and use the in-cluster Central
   endpoint `http://rook-ceph-rgw-centrals3.rook-central`.

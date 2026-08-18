@@ -111,7 +111,7 @@ spec:
   # Deliberately omitted here so the cluster is deployable for the pre-S3 timed
   # trial. Enable AFTER an S3 token + bucket exist (NRP User Portal -> S3 Tokens,
   # Central pool): put the keys in 01-s3-credentials.yaml, then patch this cluster
-  # with 09-backup.yaml (static keys + the in-cluster Central RGW endpoint).
+  # with 09-backup.patch.yaml (static keys + the in-cluster Central RGW endpoint).
   # Pairs with 04-scheduledbackup.yaml.
 
   monitoring:
