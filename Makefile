@@ -7,7 +7,7 @@ SECRETS ?= secrets.yaml
 ROLE    ?= app
 
 REGISTRY      ?= ghcr.io/skyportal/skyportal-nrp
-SKYPORTAL_SHA := $(shell git -C skyportal rev-parse --short HEAD 2>/dev/null)
+SKYPORTAL_SHA := $(shell git -C skyportal rev-parse --short=7 HEAD 2>/dev/null)
 # Same scheme the CI workflow uses, so a local build and a CI build of the same
 # submodule commit produce the same tag.
 BASE_TAG      ?= sp-$(SKYPORTAL_SHA)

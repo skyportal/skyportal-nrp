@@ -62,7 +62,7 @@ jobs:
       - name: Resolve tags
         id: tags
         run: |
-          SP_SHA=$(git -C skyportal rev-parse --short HEAD)
+          SP_SHA=$(git -C skyportal rev-parse --short=7 HEAD)
           echo "sp_sha=${SP_SHA}" >> "$GITHUB_OUTPUT"
           # Lowercase: GHCR rejects uppercase repository names.
           echo "image=$(echo "${REGISTRY}/${IMAGE}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"

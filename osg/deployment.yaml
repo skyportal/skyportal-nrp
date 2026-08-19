@@ -66,7 +66,7 @@ spec:
         - name: osg
           # Keep in step with image.tag in values-nrp.yaml: the OSG plugin runs
           # out of the same image as the app (services/osg is baked in).
-          image: ghcr.io/skyportal/skyportal-nrp:sp-ae69874f
+          image: ghcr.io/skyportal/skyportal-nrp:sp-ae69874
           imagePullPolicy: IfNotPresent
           # Wrapper does two NRP-specific setup steps, then execs the plugin:
           #  1. Stage the AP IDTOKEN into ~/.condor/tokens.d at 0600 — HTCondor

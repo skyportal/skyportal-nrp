@@ -8,7 +8,7 @@ image:
   # Built by .github/workflows/build-image.yml on push (and by `make image`
   # locally). The tag is sp-<skyportal submodule short sha>; skyportal-data
   # (sncosmo) is baked in by the Dockerfile, so no extra -rN suffix is needed.
-  tag: "sp-ae69874f"
+  tag: "sp-ae69874"
 
 # NRP west region (us-central storage is full).
 postgres:
