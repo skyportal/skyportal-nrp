@@ -22,12 +22,10 @@ observability/           # Grafana (Prometheus sidecar itself comes from the cha
 loadtest/                # k6 job
 ```
 
-**The chart is on a non-default branch.** `skyportal-k8s-deploy`'s default branch (`master`) still
-holds the older kustomize layout with no `chart/` directory — the Helm chart lives on
-**`modernize-helm-chart`**. Clone accordingly:
+The Makefile expects the chart as a sibling clone:
 
 ```bash
-git clone -b modernize-helm-chart git@github.com:skyportal/skyportal-k8s-deploy.git ../skyportal-k8s-deploy
+git clone git@github.com:skyportal/skyportal-k8s-deploy.git ../skyportal-k8s-deploy
 ```
 
 ## Image

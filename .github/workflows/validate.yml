@@ -33,9 +33,7 @@ jobs:
           # `make lint` / `make template` work unchanged in CI.
           repository: skyportal/skyportal-k8s-deploy
           path: skyportal-k8s-deploy
-          # The chart lives on this branch, NOT on the default branch (master),
-          # which still holds the older kustomize-style layout with no chart/.
-          ref: modernize-helm-chart
+          ref: main
 
       - uses: azure/setup-helm@v4
 
